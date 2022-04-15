@@ -11,20 +11,6 @@
 
 // UCB0SDA = P3.0; UCB0SCL = P3.1
 
-// LCD STUFF
-
-void initLCD();
-void initADC();
-void sendNibble(uint8_t isInstruction, unsigned char nibble);
-void sendByte(uint8_t isInstruction, unsigned char byte);
-void registerCharacter(unsigned char charMapping[8], uint8_t CGRamAddress);
-void newChar();
-void moveCursor(uint8_t line, uint8_t col);
-void configButtons();
-void buildBuffer(unsigned char buffer[2][16], char *line0, char *line1);
-void flushBuffer(unsigned char buffer[2][16]);
-void confRefreshRate();
-
 // I2C STUFF
 
 void initialize_I2C_UCB0_MasterTransmitter();
@@ -72,8 +58,9 @@ typedef enum {
 measure_mode currentMode = A1;
 
 void updateCurrentMeasurementBuffer(TransientBuffer **msrBuf, measure_mode mod);
+void delay_cycles(unsigned int loopCount);
 
-char number[17] = { 'A', A1 + '0', '=', '0', '.', '0', '0', '0', 'V', ' ', '0',
+char number[17] = { 'A', A1 + '0', '=', '0', ',', '0', '0', '0', 'V', ' ', '0',
                     'x', '0', '0', '0', '0', '\0' };
 char bar[17] = { ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ',
                  ' ', ' ', ' ', ' ', '\0' };
@@ -81,23 +68,41 @@ char bar[17] = { ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ',
 #define MAX_ADC_MEASURE 4096
 
 void delay_us(unsigned int time_us, unsigned int loop_count);
-void debounceS1();
-void debounceS2();
 
 #define TRUE 1
 #define FALSE 0
 
-int sw_pressed = 0, fraction = 0;
+int sw_pressed = 0, fraction = 0, flag = 0, debounce = 0;
 
 unsigned char buffer[2][16] = {
         { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0,
                                                               0, 0, 0, 0, 0, 0,
                                                               0, 0, 0, 0 } };
 
+// LCD STUFF
+
+void initLCD();
+void initADC();
+void sendNibble(uint8_t isInstruction, unsigned char nibble);
+void sendByte(uint8_t isInstruction, unsigned char byte);
+void registerCharacter(unsigned char charMapping[8], uint8_t CGRamAddress);
+void newChar();
+void moveCursor(uint8_t line, uint8_t col);
+void configButtons();
+void buildBuffer(unsigned char buffer[2][16], char *line0, char *line1);
+void flushBuffer(unsigned char buffer[2][16]);
+void confRefreshRate();
+char* numberToStr(char *numberStr, int voltFraction, int measurementAvg,
+                  measure_mode currentMode);
+char* computeBar(char *bar, int number);
+
 int main(void) {
     WDTCTL = WDTPW | WDTHOLD;	// stop watchdog timer
 
     initBuffer(&xTBuf);
+    initBuffer(&yTBuf);
+    initBuffer(&ldr1TBuf);
+    initBuffer(&ldr2TBuf);
     initADC();
     initialize_I2C_UCB0_MasterTransmitter();
     configButtons();
@@ -120,15 +125,23 @@ int main(void) {
 
     LED_RED_OFF;
     LED_GREEN_OFF;
-
     while (TRUE) {
+        if (flag) {
+            flag = 0;
+            numberToStr(number, fraction / 10, currentMeasurementBuffer->avg,
+                        currentMode);
+            computeBar(bar, fraction);
+            buildBuffer(&buffer, number, bar);
+            flushBuffer(buffer);
+        }
+
         if (sw_pressed) {
+            //__delay_cycles(50000);
+            //debounce = 0;
             if (currentMode < A6) currentMode++;
             else currentMode = A1;
             updateCurrentMeasurementBuffer(&currentMeasurementBuffer,
                                            currentMode);
-            number[1] = currentMode + '0';
-            debounceS2();
             sw_pressed = 0;
         }
     }
@@ -151,10 +164,10 @@ void updateCurrentMeasurementBuffer(TransientBuffer **msrBuf, measure_mode mod) 
         *msrBuf = &ldr2TBuf;
         break;
     case A5:
-        *msrBuf = &ldr1TBuf;
+        *msrBuf = &xTBuf;
         break;
     case A6:
-        *msrBuf = &ldr2TBuf;
+        *msrBuf = &xTBuf;
         break;
     }
 
@@ -171,14 +184,6 @@ void registerBlockChars() {
                 { line, line, line, line, line, line, line, line };
         registerCharacter(blockCharacter, i + 1);
     }
-}
-
-void debounceS2() {
-    delay_cycles(10);
-    do {
-        P2IFG = 0;
-    } while (P2IFG != 0);
-    P2IE |= BIT1;
 }
 
 void buildBuffer(unsigned char buffer[2][16], char *line0, char *line1) {
@@ -251,12 +256,8 @@ void master_TransmitOneByte(unsigned char address, unsigned char data) {
 
     //Verifico se é um ACK ou um NACK
     if ((UCB0IFG & UCNACKIFG) != 0) {
-        //Peço uma condição de parada
-        LED_RED_ON;
         UCB0CTL1 |= UCTXSTP;
     } else {
-        //Peço uma condição de parada
-        LED_GREEN_ON;
         UCB0CTL1 |= UCTXSTP;
     }
 
@@ -337,50 +338,72 @@ void configButtons() {
     } while (P2IFG != 0);
 }
 
-#pragma vector = PORT2_VECTOR;
-__interrupt void s1_isr(void) {
-    switch (P2IV) {
-    case P2IV_P2IFG1:
-        P2IE &= ~BIT1;
-        sw_pressed = 1;
-        break;
-    default:
-        break;
-    }
-}
-
 void confRefreshRate() {
+    TA1CTL = TASSEL__SMCLK | MC__UP;
+    TA1CCTL0 = CCIE;
+    TA1CCR0 = 32768 >> 2;
+
     TB0CTL = TBSSEL__ACLK | ID__1 | MC__UP | TBCLR;
-    TB0CCTL0 = CCIE;
     TB0CCTL1 = OUTMOD_2;
 
-    int ticksToRefresh = 32768 >> 2;
+    int ticksToRefresh = 32768 >> 5;
     TB0CCR0 = ticksToRefresh;
-    TB0CCR1 = ticksToRefresh >> 4;
+    TB0CCR1 = ticksToRefresh >> 1;
 }
 
 const char hexDigits[16] = { '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
                              'A', 'B', 'C', 'D', 'E', 'F' };
-unsigned char* numberToStr(char *numberStr, int voltFraction,
-                           int measurementAvg) {
-    int digit;
+const char numericalTemplate[17] = { 'A', A1 + '0', '=', '0', ',', '0', '0',
+                                     '0', 'V', ' ', '0', 'x', '0', '0', '0',
+                                     '0', '\0' };
+const char qualitativeTemplate[17] = { 'A', A1 + '0', ':', ' ', ' ', ' ', ' ',
+                                       ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ',
+                                       ' ', '\0' };
+const char level1[] = "ILUMINADO";
+const char level2[] = "LUSCO-FUSCO";
+const char level3[] = "ESCURO";
+char* numberToStr(char *numberStr, int voltFraction, int measurementAvg,
+                  measure_mode currentMode) {
     uint8_t i = 0;
-    for (i = 0; i < 4; i++) {
-        numberStr[15 - i] = hexDigits[(measurementAvg & 0b1111)];
-        measurementAvg >>= 4;
-    }
+    const char *currentLevelText;
+    if (currentMode >= A5) {
+        for (i = 0; i < 16; i++)
+            numberStr[i] = qualitativeTemplate[i];
 
-    digit = voltFraction % 10;
-    numberStr[7] = digit + '0';
-    voltFraction = (voltFraction - digit) / 10;
-    digit = voltFraction % 10;
-    numberStr[6] = digit + '0';
-    voltFraction = (voltFraction - digit) / 10;
-    digit = voltFraction % 10;
-    numberStr[5] = digit + '0';
-    voltFraction = (voltFraction - digit) / 10;
-    digit = voltFraction % 10;
-    numberStr[3] = digit + '0';
+        if (voltFraction < 1100) {
+            currentLevelText = level1;
+        } else if (voltFraction < 2200) {
+            currentLevelText = level2;
+        } else {
+            currentLevelText = level3;
+        }
+
+        for (i = 3; *currentLevelText; i++, currentLevelText++)
+            numberStr[i] = *currentLevelText;
+
+    } else {
+        for (i = 0; i < 16; i++)
+            numberStr[i] = numericalTemplate[i];
+
+        int digit;
+        for (i = 0; i < 4; i++) {
+            numberStr[15 - i] = hexDigits[(measurementAvg & 0b1111)];
+            measurementAvg >>= 4;
+        }
+
+        digit = voltFraction % 10;
+        numberStr[7] = digit + '0';
+        voltFraction = (voltFraction - digit) / 10;
+        digit = voltFraction % 10;
+        numberStr[6] = digit + '0';
+        voltFraction = (voltFraction - digit) / 10;
+        digit = voltFraction % 10;
+        numberStr[5] = digit + '0';
+        voltFraction = (voltFraction - digit) / 10;
+        digit = voltFraction % 10;
+        numberStr[3] = digit + '0';
+    }
+    numberStr[1] = currentMode + '0';
 
     return numberStr;
 }
@@ -388,19 +411,26 @@ unsigned char* numberToStr(char *numberStr, int voltFraction,
 #pragma vector = ADC12_VECTOR
 __interrupt void ADC12_interrupt(void) {
     switch (_even_in_range(ADC12IV, 0x24)) {
-    case ADC12IV_ADC12IFG0:       //MEM0
+    case ADC12IV_ADC12IFG4:       //MEM4
         pushToBuffer(&xTBuf, ADC12MEM0);
-        fraction = updateBufferAvg(currentMeasurementBuffer)
-                * (33000 / (float) MAX_ADC_MEASURE);
-        break;
-    case ADC12IV_ADC12IFG1:       //MEM1
+        updateBufferAvg(&xTBuf);
+
         pushToBuffer(&yTBuf, ADC12MEM1);
-        break;
-    case ADC12IV_ADC12IFG2:       //MEM2
+        updateBufferAvg(&yTBuf);
+
         pushToBuffer(&ldr1TBuf, ADC12MEM2);
-        break;
-    case ADC12IV_ADC12IFG3:       //MEM3
+        updateBufferAvg(&ldr1TBuf);
+
         pushToBuffer(&ldr2TBuf, ADC12MEM3);
+        updateBufferAvg(&ldr2TBuf);
+
+        fraction = currentMeasurementBuffer->avg
+                * (33000 / (float) MAX_ADC_MEASURE);
+
+        //if(!debounce) {
+            sw_pressed = sw_pressed || ADC12MEM4 < 500;
+            debounce = sw_pressed;
+        //}
         break;
     default:
         break;
@@ -412,6 +442,8 @@ void initADC() {
     P6SEL |= BIT2;
     P6SEL |= BIT3;
     P6SEL |= BIT4;
+    P6SEL |= BIT5;
+    P6REN |= BIT5;
 
     // Desliga o ADC
     ADC12CTL0 &= ~ADC12ENC;
@@ -430,10 +462,11 @@ void initADC() {
     ADC12MCTL0 = ADC12SREF_0 | ADC12INCH_1; // A1 == P6.1
     ADC12MCTL1 = ADC12SREF_0 | ADC12INCH_2; // A2 == P6.2
     ADC12MCTL2 = ADC12SREF_0 | ADC12INCH_3; // A3 == P6.3
-    ADC12MCTL3 = ADC12SREF_0 | ADC12EOS | ADC12INCH_4; // A4 == P6.4
+    ADC12MCTL3 = ADC12SREF_0 | ADC12INCH_4; // A4 == P6.4
+    ADC12MCTL4 = ADC12SREF_0 | ADC12EOS | ADC12INCH_5;
 
     // Liga as interrupcoes
-    ADC12IE = ADC12IE0 | ADC12IE1 | ADC12IE2 | ADC12IE3;
+    ADC12IE = ADC12IE4;
 
     // Liga o ADC
     ADC12CTL0 |= ADC12ENC;
@@ -457,14 +490,11 @@ char* computeBar(char *bar, int number) {
     return bar;
 }
 
-#pragma vector = TIMER0_B0_VECTOR
-__interrupt void timer_a0_isr() {
-    switch (TB0IV) {
+#pragma vector = TIMER1_A0_VECTOR
+__interrupt void timer_a1_isr() {
+    switch (TA1IV) {
     default:
-        numberToStr(number, fraction / 10, currentMeasurementBuffer->avg);
-        computeBar(bar, fraction);
-        buildBuffer(&buffer, number, bar);
-        flushBuffer(buffer);
+        flag = 1;
         break;
     }
 }
