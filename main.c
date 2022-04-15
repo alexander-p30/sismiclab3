@@ -72,7 +72,7 @@ void delay_us(unsigned int time_us, unsigned int loop_count);
 #define TRUE 1
 #define FALSE 0
 
-int sw_pressed = 0, fraction = 0, flag = 0, debounce = 0;
+int sw_pressed = 0, ready = 1, fraction = 0, flag = 0, debounce = 0;
 
 unsigned char buffer[2][16] = {
         { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0,
@@ -95,6 +95,7 @@ void confRefreshRate();
 char* numberToStr(char *numberStr, int voltFraction, int measurementAvg,
                   measure_mode currentMode);
 char* computeBar(char *bar, int number);
+void updateRedLedPWM(measure_mode currentMode, int voltFraction);
 
 int main(void) {
     WDTCTL = WDTPW | WDTHOLD;	// stop watchdog timer
@@ -133,20 +134,34 @@ int main(void) {
             computeBar(bar, fraction);
             buildBuffer(&buffer, number, bar);
             flushBuffer(buffer);
+            updateRedLedPWM(currentMode, fraction);
         }
 
-        if (sw_pressed) {
-            //__delay_cycles(50000);
-            //debounce = 0;
+        if (sw_pressed && ready) {
             if (currentMode < A6) currentMode++;
             else currentMode = A1;
             updateCurrentMeasurementBuffer(&currentMeasurementBuffer,
                                            currentMode);
             sw_pressed = 0;
+            ready = 0;
         }
     }
 
     return 0;
+}
+
+void updateRedLedPWM(measure_mode currMode, int voltFraction) {
+    if(currMode < A5) {
+        TA2CTL = TACLR;
+        return;
+    }
+
+    TA2CTL = TASSEL__SMCLK | MC__UP | TACLR;
+    TA2CCR0 = 10000;
+    // TA2CCR1 = compute
+    // TA2CCTLX = OUTMOD_X;
+
+    // TODO: RED LED PWM
 }
 
 void updateCurrentMeasurementBuffer(TransientBuffer **msrBuf, measure_mode mod) {
@@ -164,10 +179,10 @@ void updateCurrentMeasurementBuffer(TransientBuffer **msrBuf, measure_mode mod) 
         *msrBuf = &ldr2TBuf;
         break;
     case A5:
-        *msrBuf = &xTBuf;
+        *msrBuf = &ldr1TBuf;
         break;
     case A6:
-        *msrBuf = &xTBuf;
+        *msrBuf = &ldr2TBuf;
         break;
     }
 
@@ -427,10 +442,8 @@ __interrupt void ADC12_interrupt(void) {
         fraction = currentMeasurementBuffer->avg
                 * (33000 / (float) MAX_ADC_MEASURE);
 
-        //if(!debounce) {
-            sw_pressed = sw_pressed || ADC12MEM4 < 500;
-            debounce = sw_pressed;
-        //}
+        ready = ready || ADC12MEM4 > 500;
+        sw_pressed = (sw_pressed || ADC12MEM4 < 500) && ready;
         break;
     default:
         break;
