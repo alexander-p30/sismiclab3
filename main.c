@@ -13,8 +13,8 @@
 
 // I2C STUFF
 
-void initialize_I2C_UCB0_MasterTransmitter();
-void master_TransmitOneByte(unsigned char address, unsigned char data);
+void initI2C();
+void I2CSendByte(unsigned char address, unsigned char data);
 
 // TransientBuffer
 #define BUFFER_SIZE 4
@@ -58,7 +58,6 @@ typedef enum {
 measure_mode currentMode = A1;
 
 void updateCurrentMeasurementBuffer(TransientBuffer **msrBuf, measure_mode mod);
-void delay_cycles(unsigned int loopCount);
 
 char number[17] = { 'A', A1 + '0', '=', '0', ',', '0', '0', '0', 'V', ' ', '0',
                     'x', '0', '0', '0', '0', '\0' };
@@ -104,8 +103,9 @@ int main(void) {
     initBuffer(&yTBuf);
     initBuffer(&ldr1TBuf);
     initBuffer(&ldr2TBuf);
+    updateCurrentMeasurementBuffer(&currentMeasurementBuffer, currentMode);
     initADC();
-    initialize_I2C_UCB0_MasterTransmitter();
+    initI2C();
     configButtons();
     confRefreshRate();
     initLCD();
@@ -114,12 +114,21 @@ int main(void) {
 
     __enable_interrupt();
 
-    //LED VERMELHO
+    // REFRESH RATE PIN
+    P2DIR |= BIT0;
+    P2SEL |= BIT0;
+    P2REN |= BIT0;
+
+    // PWM PIN
+    P2DIR |= BIT4;
+    P2SEL |= BIT4;
+
+    // LED VERMELHO
     P1SEL &= ~BIT0;
     P1DIR |= BIT0;
     P1OUT &= ~BIT0;
 
-    //LED VERDE
+    // LED VERDE
     P4SEL &= ~BIT7;
     P4DIR |= BIT7;
     P4OUT &= ~BIT7;
@@ -151,17 +160,26 @@ int main(void) {
 }
 
 void updateRedLedPWM(measure_mode currMode, int voltFraction) {
-    if(currMode < A5) {
-        TA2CTL = TACLR;
+    TA2CTL = TACLR;
+
+    if (currMode < A5) {
         return;
+    }
+
+    float multiplier;
+
+    if (voltFraction < 11000) {
+        multiplier = 0.05;
+    } else if (voltFraction < 22000) {
+        multiplier = 0.5;
+    } else {
+        multiplier = 0.95;
     }
 
     TA2CTL = TASSEL__SMCLK | MC__UP | TACLR;
     TA2CCR0 = 10000;
-    // TA2CCR1 = compute
-    // TA2CCTLX = OUTMOD_X;
-
-    // TODO: RED LED PWM
+    TA2CCR1 = 10000 * multiplier;
+    TA2CCTL1 = OUTMOD_2;
 }
 
 void updateCurrentMeasurementBuffer(TransientBuffer **msrBuf, measure_mode mod) {
@@ -223,58 +241,42 @@ void buildBuffer(unsigned char buffer[2][16], char *line0, char *line1) {
     }
 }
 
-void initialize_I2C_UCB0_MasterTransmitter() {
-    //Desliga o módulo
+void initI2C() {
+    // Desliga o modulo
     UCB0CTL1 |= UCSWRST;
 
     //Configura os pinos
     P3SEL |= BIT0;
     P3SEL |= BIT1;
 
-    UCB0CTL0 = UCMST |           //Master Mode
-            UCMODE_3 |    //I2C Mode
-            UCSYNC;         //Synchronous Mode
+    UCB0CTL0 = UCMST | UCMODE_3 | UCSYNC;
 
-    UCB0CTL1 = UCSSEL__SMCLK |    //Clock Source: ACLK
-            UCTR |                      //Transmitter
-            UCSWRST;             //Mantém o módulo desligado
+    UCB0CTL1 = UCSSEL__SMCLK | UCTR | UCSWRST;
 
-    //Divisor de clock para o BAUDRate
+    // Configura BR
     UCB0BR0 = 2;
     UCB0BR1 = 0;
 
-    //Liga o módulo.
+    // Liga o modulo
     UCB0CTL1 &= ~UCSWRST;
 }
 
-void master_TransmitOneByte(unsigned char address, unsigned char data) {
-    //Desligo todas as interrupções
+void I2CSendByte(unsigned char address, unsigned char data) {
     UCB0IE = 0;
 
-    //Coloco o slave address
     UCB0I2CSA = address;
 
-    //Espero a linha estar desocupada.
     if (UCB0STAT & UCBBUSY) return;
 
-    //Peço um START
     UCB0CTL1 |= UCTXSTT;
 
-    //Espero até o buffer de transmissão estar disponível
     while ((UCB0IFG & UCTXIFG) == 0);
 
-    //Escrevo o dado
     UCB0TXBUF = data;
 
-    //Aguardo o acknowledge
     while (UCB0CTL1 & UCTXSTT);
 
-    //Verifico se é um ACK ou um NACK
-    if ((UCB0IFG & UCNACKIFG) != 0) {
-        UCB0CTL1 |= UCTXSTP;
-    } else {
-        UCB0CTL1 |= UCTXSTP;
-    }
+    UCB0CTL1 |= UCTXSTP;
 
     return;
 }
@@ -288,11 +290,11 @@ void sendNibble(uint8_t isInstruction, unsigned char nibble) {
         byte |= BIT0;
     }
 
-    master_TransmitOneByte(LCD_ADDR.PERIPHERAL, byte);
+    I2CSendByte(LCD_ADDR.PERIPHERAL, byte);
     delay_us(300, 1);
-    master_TransmitOneByte(LCD_ADDR.PERIPHERAL, byte | BIT2);
+    I2CSendByte(LCD_ADDR.PERIPHERAL, byte | BIT2);
     delay_us(600, 1);
-    master_TransmitOneByte(LCD_ADDR.PERIPHERAL, byte);
+    I2CSendByte(LCD_ADDR.PERIPHERAL, byte);
     delay_us(300, 1);
 }
 
@@ -361,7 +363,7 @@ void confRefreshRate() {
     TB0CTL = TBSSEL__ACLK | ID__1 | MC__UP | TBCLR;
     TB0CCTL1 = OUTMOD_2;
 
-    int ticksToRefresh = 32768 >> 5;
+    const int ticksToRefresh = 32768 >> 4;
     TB0CCR0 = ticksToRefresh;
     TB0CCR1 = ticksToRefresh >> 1;
 }
@@ -463,12 +465,7 @@ void initADC() {
 
     ADC12CTL0 = ADC12SHT0_3 | ADC12ON;
 
-    ADC12CTL1 = ADC12CSTARTADD_0 |
-    ADC12SHS_3 |              // Trigger B0.1
-            ADC12SHP |
-            ADC12DIV_0 |
-            ADC12SSEL_0 |             // MODCLK == 4.8 MHz
-            ADC12CONSEQ_3;            // autoscan repeat
+    ADC12CTL1 = ADC12CSTARTADD_0 | ADC12SHS_3 | ADC12SHP | ADC12DIV_0 | ADC12SSEL_0 | ADC12CONSEQ_3;
 
     ADC12CTL2 = ADC12TCOFF | ADC12RES_2;
 
@@ -508,13 +505,9 @@ __interrupt void timer_a1_isr() {
     switch (TA1IV) {
     default:
         flag = 1;
+        P2OUT ^= BIT0;
         break;
     }
-}
-
-void delay_cycles(unsigned int loop_count) {
-    while (loop_count--)
-        __delay_cycles(50000);
 }
 
 void delay_us(unsigned int time_us, unsigned int loop_count) {
